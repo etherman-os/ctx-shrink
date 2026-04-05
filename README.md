@@ -24,19 +24,24 @@ In March 2026, 512,000 lines of source code leaked through a single forgotten `*
 
 ## 🚀 Install
 
-```bash
-# Single file — download and run
-curl -sL https://raw.githubusercontent.com/etherman-os/ctx-shrink/main/ctx-shrink -o /usr/local/bin/ctx-shrink
-chmod +x /usr/local/bin/ctx-shrink
-```
-
-Or clone:
+### Option 1: Clone and run (recommended)
 
 ```bash
 git clone https://github.com/etherman-os/ctx-shrink.git
 cd ctx-shrink
 python3 ctx-shrink /path/to/your/project
 ```
+
+### Option 2: Install globally
+
+```bash
+curl -sL https://raw.githubusercontent.com/etherman-os/ctx-shrink/main/ctx-shrink -o /tmp/ctx-shrink
+sha256sum /tmp/ctx-shrink   # verify integrity before installing
+sudo mv /tmp/ctx-shrink /usr/local/bin/ctx-shrink
+sudo chmod +x /usr/local/bin/ctx-shrink
+```
+
+> **⚠️ Always verify the checksum** before moving a script to `/usr/local/bin`.
 
 ## 📊 Usage
 
