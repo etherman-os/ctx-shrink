@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+ctx-shrink v2 — Smart codebase analyzer for AI coding agents
+
+Scans a project, maps architecture/endpoints/models/dependencies,
+and outputs a smart context map (not a code dump).
+Also checks .gitignore safety to prevent credential leaks like Claude Code's.
+"""
+
+import os, sys, json, re, argparse, fnmatch, subprocess
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+
+# ─── Config ──────────────────────────────────────────────────────────
+IGNORED_DIRS = {
+    '.git', 'node_modules', 'vendor', '__pycache__', '.venv', 'venv',
+    'dist', 'build', 'out', '.next', '.nuxt', '.output', '.cache',
+    '.idea', '.vscode', 'coverage', '.tox', '.mypy_cache',
+    'target', '.gradle', 'bun.lockb'
+}
+
+IGNORED_EXTS = {
+    '.lock', '.log', '.map', '.ico', '.png', '.jpg', '.jpeg', '.gif',
+    '.svg', '.webp', '.woff', '.woff2', '.ttf', '.eot', '.pyc', '.pyo',
+    '.class', '.jar', '.dll', '.so', '.dylib', '.exe', '.bin', '.dat',
+    '.bak', '.min.js', '.min.css', '.pdf', '.pem', '.key', '.pfx', '.p12',
+}
+
+# Sensitive file names that should NEVER be scanned or leaked
+SENSITIVE_NAMES = {
+    '.env', '.env.local', '.env.production', '.env.development',
+    '.env.staging', '.env.test',
+    '.secrets', '.credentials', '.htpasswd',
+    'secrets.json', 'credentials.json', 'service-account.json',
+    'id_rsa', 'id_dsa', 'id_ed25519', 'id_ecdsa', 'authorized_keys',
+    '.npmrc', '.pypirc', '.netrc', 'secrets.yml', 'secrets.yaml',
+}
+
+SENSITIVE_EXTENSIONS = {'.pem', '.key', '.pfx', '.p12'}
+
+NAMED_WEIGHTS = {
+    'package.json': 100, 'tsconfig.json': 100, 'pyproject.toml': 100,
+    'Cargo.toml': 100, 'go.mod': 100, 'CMakeLists.txt': 100,
+    'Makefile': 90, 'docker-compose.yml': 95, 'docker-compose.yaml': 95,
+    'Dockerfile': 90, '.env.example': 85, 'config.yml': 90,
+    'config.yaml': 90, 'vite.config.ts': 85, 'vite.config.js': 85,
+    'webpack.config.js': 85, 'next.config.js': 85, 'next.config.ts': 85,
+    'tailwind.config.js': 80, '.eslintrc': 80, '.prettierrc': 80,
+    'jest.config.js': 80, 'README.md': 95, 'CONTRIBUTING.md': 90,
+    'index.js': 90, 'index.ts': 90, 'main.py': 90, 'app.py': 90,
+    'main.go': 90, 'main.rs': 90, 'server.js': 90, 'server.ts': 90,
+    'requirements.txt': 85, 'Gemfile': 85, 'composer.json': 85,
+}
+
+EXT_WEIGHTS = {
+    '.js': 30, '.ts': 35, '.tsx': 35, '.jsx': 30, '.py': 35,
+    '.go': 35, '.rs': 35, '.java': 30, '.c': 25, '.cpp': 25,
+    '.css': 20, '.scss': 20, '.html': 25, '.vue': 30, '.svelte': 30,
+    '.rb': 30, '.php': 30, '.sql': 30, '.sh': 25, '.md': 40, '.rst': 35,
+    '.yaml': 40, '.yml': 40, '.toml': 45, '.xml': 30, '.json': 50,
+}
+
+EXT_LANG = {
+    '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript',
+    '.jsx': 'javascript', '.py': 'python', '.go': 'go', '.rs': 'rust',
+    '.css': 'css', '.scss': 'scss', '.sass': 'sass', '.html': 'html',
+    '.md': 'markdown', '.json': 'json', '.yaml': 'yaml', '.yml': 'yaml',
+    '.toml': 'toml', '.sql': 'sql', '.vue': 'vue', '.svelte': 'svelte',
+    '.rb': 'ruby', '.php': 'php', '.java': 'java', '.c': 'c',
+    '.cpp': 'cpp', '.sh': 'bash',
+}
+
+
+# ─── File scanning (excludes sensitive files) ───────────────────────
+def read_file_safe(path, max_lines=500):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return ''.join(f.readlines()[:max_lines])
+    except:
+        return ''
+
+
+def get_weight(name, ext):
+    if name in NAMED_WEIGHTS:
+        return NAMED_WEIGHTS[name]
+    return EXT_WEIGHTS.get(ext, 10)
+
+
+def scan_files(root, max_depth=None):
+    root = Path(root).resolve()
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith('.')]
+        depth = len(Path(dirpath).relative_to(root).parts)
+        if max_depth and depth >= max_depth:
+            dirnames.clear()
+            continue
+        for fname in filenames:
+            if fname.startswith('.'):
+                continue
+            ext = Path(fname).suffix.lower()
+            if ext in IGNORED_EXTS or ext in SENSITIVE_EXTENSIONS:
+                continue
+            if fname in SENSITIVE_NAMES:
+                continue
+            try:
+                stat = Path(dirpath, fname).stat()
+                if stat.st_size == 0 or stat.st_size > 500_000:
+                    continue
+                lines = sum(1 for _ in open(Path(dirpath, fname), errors='ignore'))
+                files.append({
+                    'path': str(Path(dirpath, fname).relative_to(root)),
+                    'ext': ext, 'size': stat.st_size, 'lines': lines,
+                    'weight': get_weight(fname, ext),
+                })
+            except:
+                continue
+    return files
+
+
+# ─── Full scan (including dotfiles) for gitignore audit ─────────────
+def scan_all(root, max_depth=None):
+    root = Path(root).resolve()
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {'.git', 'node_modules'}]
+        depth = len(Path(dirpath).relative_to(root).parts)
+        if max_depth and depth >= max_depth:
+            dirnames.clear()
+            continue
+        for fname in filenames:
+            ext = Path(fname).suffix.lower()
+            if ext in {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+                        '.woff', '.woff2', '.ttf', '.eot', '.pyc', '.lockb',
+                        '.min.js', '.min.css'}:
+                continue
+            try:
+                stat = Path(dirpath, fname).stat()
+                if stat.st_size == 0:
+                    continue
+                files.append({
+                    'path': str(Path(dirpath, fname).relative_to(root)),
+                    'ext': ext, 'size': stat.st_size,
+                })
+            except:
+                continue
+    return files
+
+
+# ─── Gitignore audit ─────────────────────────────────────────────────
+def check_gitignore(root, max_depth=None):
+    """Find files that look sensitive but are NOT in .gitignore."""
+    root = Path(root)
+    gi = root / '.gitignore'
+    gi_exists = gi.exists()
+
+    gi_patterns = []
+    if gi_exists:
+        with open(gi) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    gi_patterns.append(line.lstrip('/'))
+
+    all_files = scan_all(root, max_depth=max_depth)
+
+    def is_ignored(filepath, fname):
+        for pat in gi_patterns:
+            if fnmatch.fnmatch(fname, pat):
+                return True
+            if fnmatch.fnmatch(filepath, pat):
+                return True
+            if pat.endswith('/') and pat[:-1] in filepath:
+                return True
+        return False
+
+    at_risk = []
+    seen = set()
+    # Danger keywords for FILE NAMES only (not content, not normal code files)
+    # These match specific sensitive file patterns, NOT generic code names
+    danger_file_patterns = [
+        re.compile(r'^\..*secret.*$', re.IGNORECASE),        # .secret, .secret_backup
+        re.compile(r'^secrets?\.(yml|yaml|json|txt|ini)$', re.IGNORECASE),
+        re.compile(r'^\..*credential.*$', re.IGNORECASE),    # .credentials
+        re.compile(r'^passwords?\.(txt|json|yml|yaml|csv)$', re.IGNORECASE),
+        re.compile(r'^\..*api[_-]?key.*$', re.IGNORECASE),   # .api_key, .apikey
+        re.compile(r'^aws[_-]?secret.*$', re.IGNORECASE),    # aws_secret file
+        re.compile(r'^private[_-]?key.*$', re.IGNORECASE),   # private_key file
+        re.compile(r'^\.env(\..+)?$'),                        # .env, .env.local, etc.
+    ]
+
+    for f in all_files:
+        fname = f['path'].split('/')[-1]
+        fpath = f['path']
+
+        # Skip example files (meant to be public)
+        if '.example' in fname or '.dist' in fname or '.sample' in fname:
+            continue
+        # Skip package internals
+        if '/node_modules/' in fpath or '/__pycache__/' in fpath:
+            continue
+        # Skip .venv
+        if '/.venv/' in fpath or '/venv/' in fpath:
+            continue
+
+        is_sensitive = False
+
+        # 1) Exact name match
+        if fname in SENSITIVE_NAMES:
+            is_sensitive = True
+
+        # 2) Sensitive extension
+        if ext_lower := fname.rsplit('.', 1)[-1].lower():
+            if '.' + ext_lower in SENSITIVE_EXTENSIONS:
+                is_sensitive = True
+
+        # 3) Matches sensitive filename patterns
+        for pat in danger_file_patterns:
+            if pat.match(fname):
+                is_sensitive = True
+                break
+
+        if is_sensitive and not is_ignored(fpath, fname):
+            if fpath not in seen:
+                seen.add(fpath)
+                is_critical = any(kw in fname.lower() for kw in ('.env', 'secret', 'credential'))
+                risk = '🔴 CRITICAL' if is_critical else '🟡 WARNING'
+                at_risk.append({'path': fpath, 'size': f['size'], 'risk': risk})
+
+    return at_risk, gi_exists, len(gi_patterns)
+
+
+# ─── Publish Safety Audit ───────────────────────────────────────────
+# Catches packaging mistakes like the Claude Code source map leak
+
+def check_publish_safety(root, max_depth=None):
+    """Check for files that could leak source code or secrets during packaging."""
+    root = Path(root)
+    issues = []
+    
+    all_files = scan_all(root, max_depth=max_depth)
+    
+    # ─── 1. Check for .npmignore / MANIFEST / setup.py packaging ───
+    has_npmignore = (root / '.npmignore').exists()
+    has_package_json = (root / 'package.json').exists()
+    has_files_field = False
+    ignored_patterns_npm = set()
+    
+    if has_npmignore:
+        with open(root / '.npmignore') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    line = line.lstrip('/')
+                    ignored_patterns_npm.add(line)
+                    ignored_patterns_npm.add(line.rstrip('/'))
+    else:
+        # No .npmignore means .gitignore is used instead
+        pass
+    
+    # Check package.json "files" field
+    if has_package_json:
+        try:
+            with open(root / 'package.json') as f:
+                pkg = json.loads(f.read())
+            if 'files' in pkg:
+                has_files_field = True
+        except:
+            pass
+    
+    # Check setup.py / pyproject.toml for exclude_package_data
+    has_pyproject = (root / 'pyproject.toml').exists()
+    has_setup = (root / 'setup.py').exists()
+    
+    # ─── 2. Files that should NEVER be in a published package ───
+    # Only check truly dangerous patterns, not every IDE file
+    dangerous_patterns = {
+        '*.map': '🔴 Can expose entire source code (like Claude Code leak)',
+        '*.log': '🟡 Log file — may contain sensitive data',
+        '*.key': '🔴 Private key file',
+        '*.pem': '🔴 PEM certificate/key',
+        '*.p12': '🔴 PKCS12 certificate',
+        '*.pfx': '🔴 PKCS12 certificate',
+    }
+    # Directories to completely ignore for this audit
+    skip_dirs = {'node_modules/', '.venv/', 'venv/', '__pycache__/', 
+                 '.agent/', '.kilocode/', '.git/', '.idea/', '.vscode/',
+                 'dist/', 'build/', 'target/', 'coverage/'}
+    
+    # ─── 3. Scan files that shouldn't be in packages ───
+    def is_npm_ignored(filepath, fname):
+        """Check if a file would be excluded from npm publish."""
+        # If "files" is set in package.json, everything NOT listed is excluded
+        if has_files_field:
+            return False  # Can't determine without exact matching
+        # Otherwise .npmignore rules (or .gitignore if no .npmignore)
+        patterns = ignored_patterns_npm
+        if not patterns:
+            # Fall back to .gitignore as .npmignore
+            gi = root / '.gitignore'
+            if gi.exists():
+                with open(gi) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            patterns.add(line.lstrip('/'))
+        
+        for pat in patterns:
+            base = pat.rstrip('/')
+            if '/' in pat:  # path pattern
+                if fnmatch.fnmatch(filepath, base): return True
+            else:  # filename pattern
+                if fnmatch.fnmatch(fname, base): return True
+                if fnmatch.fnmatch(fname, pat.lstrip('*')): return True
+                # Handle *.ext patterns
+                if pat.startswith('**/') or pat.startswith('/'):
+                    pass
+        return False
+    
+    for f in all_files:
+        fname = f['path'].split('/')[-1]
+        fpath = f['path']
+        ext = Path(fname).suffix.lower()
+        
+        # Skip example files
+        if '.example' in fname or '.sample' in fname:
+            continue
+        # Skip internal/package directories — BUT check dangerous files anyway
+        in_skip_dir = any(fpath.startswith(d) for d in skip_dirs)
+        
+        # Check each dangerous pattern
+        for pattern, description in dangerous_patterns.items():
+            matched = False
+            if fnmatch.fnmatch(fname, pattern):
+                matched = True
+            
+            if matched:
+                # Skip well-known package certs/keys (false positives)
+                if fpath.endswith('/cacert.pem') or 'certifi' in fpath:
+                    break
+                # If in skip_dir but is truly dangerous (source maps, keys), still report
+                if in_skip_dir and pattern in ('*.map', '*.key', '*.pem', '*.p12', '*.pfx'):
+                    issues.append({'path': fpath, 'description': description, 'size': f['size']})
+                    break
+                elif not in_skip_dir:
+                    if not is_npm_ignored(fpath, fname):
+                        issues.append({'path': fpath, 'description': description, 'size': f['size']})
+                    break
+    
+    # ─── 4. Check for specific known-dangerous scenarios ───
+    warnings = []
+    
+    # Node.js but no .npmignore and no "files" field
+    if has_package_json and not has_npmignore and not has_files_field:
+        # Check if .gitignore exists (npm uses it as fallback)
+        gi = root / '.gitignore'
+        if not gi.exists():
+            warnings.append('🔴 No .npmignore, no "files" in package.json, and no .gitignore → ALL files will be published!')
+        elif not any('*.map' in line.strip() for line in open(gi) if line.strip() and not line.strip().startswith('#')):
+            warnings.append('🟡 No *.map in .npmignore or .gitignore → source maps could leak (like Claude Code issue)')
+        else:
+            warnings.append('✅ .gitignore has *.map — source maps won\'t be published')
+    
+    # Python but no LICENSE
+    if (has_pyproject or has_setup) and not (root / 'LICENSE').exists():
+        warnings.append('🟢 No LICENSE file — consider adding one before publishing')
+    
+    # Large files in package
+    large_files = [f for f in all_files if f['size'] > 1_000_000 and '/node_modules/' not in f['path']]
+    if large_files:
+        for f in large_files[:5]:
+            fname = f['path'].split('/')[-1]
+            warnings.append(f'🟢 Large file ({f["size"]/1024/1024:.1f} MB): {f["path"]} — could bloat package')
+    
+    return issues, warnings
+
+
+# ─── Analyzers ───────────────────────────────────────────────────────
+def analyze_project_type(files):
+    signals = [
+        ('Python Flask', lambda: any(f['path'] in ('app.py', 'wsgi.py', 'application.py') for f in files)),
+        ('Python Django', lambda: any(f['path'] == 'manage.py' for f in files)),
+        ('Python FastAPI', lambda: any('fastapi' in f['path'].lower() for f in files) or any(f['path'] == 'main.py' for f in files)),
+        ('Node.js Express', lambda: any(f['path'] in ('app.js', 'server.js') for f in files)),
+        ('React (Vite)', lambda: any(f['path'] in ('vite.config.js', 'vite.config.ts') for f in files)),
+        ('React (Next.js)', lambda: any(f['path'] in ('next.config.js', 'next.config.ts') for f in files)),
+        ('Vue.js', lambda: any('vue' in f['path'].lower() for f in files)),
+        ('TypeScript', lambda: any(f['ext'] in ('.ts', '.tsx') for f in files)),
+        ('Go', lambda: any(f['ext'] == '.go' for f in files)),
+        ('Rust', lambda: any(f['ext'] == '.rs' for f in files)),
+        ('Docker', lambda: any(f['path'] == 'Dockerfile' for f in files)),
+        ('Docker Compose', lambda: any('docker-compose' in f['path'] for f in files)),
+    ]
+    return [name for name, check in signals if check()] or ['Unknown']
+
+
+def extract_endpoints(files, root):
+    endpoints = []
+    seen = set()
+
+    route_patterns = [
+        re.compile(r'@(?:app|router|blueprint)\.(get|post|put|delete|patch)\s*\(\s*[\'"](/[^\'"]*)'),
+        re.compile(r'@(?:app|router|blueprint)\.route\s*\(\s*[\'"](/[^\'"]*)'),
+        re.compile(r'(?:app|router)\.(get|post|put|delete)\s*\(\s*[\'"](/[^\'"]*)'),
+        re.compile(r'(?:path|url)\s*\(\s*r?[\'"]([^\'"]*)'),
+    ]
+
+    for f in files:
+        if f['ext'] not in ('.py', '.js', '.ts'):
+            continue
+        content = read_file_safe(root / f['path'], 300)
+        for pat in route_patterns:
+            for m in pat.finditer(content):
+                method = (m.group(1) or 'GET').upper() if m.lastindex else 'GET'
+                path = m.group(2) if m.lastindex else m.group(1)
+                key = f"{method}:{path}:{f['path']}"
+                if key not in seen:
+                    seen.add(key)
+                    endpoints.append({'method': method, 'path': path, 'file': f['path']})
+
+    return sorted(endpoints, key=lambda e: e['path'])
+
+
+def extract_models(files, root):
+    models = []
+    seen = set()
+
+    py_model_re = re.compile(r'class\s+(\w+)\s*\(\s*(?:Base|db\.Model|Model|SQLModel|DeclarativeBase|ndb\.Model)\s*\)', re.MULTILINE)
+    pydantic_re = re.compile(r'class\s+(\w+)\s*\(\s*BaseModel\s*\)', re.MULTILINE)
+    mongoose_re = re.compile(r'(?:const|let|var)\s+(\w+)(?:Schema)?\s*=\s*(?:new\s+)?Schema\s*\(', re.MULTILINE)
+    sql_table_re = re.compile(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)', re.IGNORECASE | re.MULTILINE)
+
+    for f in files:
+        if f['ext'] == '.py':
+            content = read_file_safe(root / f['path'], 400)
+            for m in py_model_re.finditer(content):
+                k = m.group(1)
+                if k not in seen:
+                    seen.add(k)
+                    models.append({'name': k, 'type': 'ORM Model', 'file': f['path']})
+            for m in pydantic_re.finditer(content):
+                k = m.group(1)
+                if k not in seen:
+                    seen.add(k)
+                    models.append({'name': k, 'type': 'Pydantic', 'file': f['path']})
+        elif f['ext'] in ('.js', '.ts', '.jsx', '.tsx'):
+            content = read_file_safe(root / f['path'], 400)
+            for m in mongoose_re.finditer(content):
+                k = m.group(1)
+                if k not in seen:
+                    seen.add(k)
+                    models.append({'name': k, 'type': 'Mongoose', 'file': f['path']})
+        elif f['ext'] == '.sql':
+            content = read_file_safe(root / f['path'], 500)
+            for m in sql_table_re.finditer(content):
+                k = m.group(1)
+                if k not in seen:
+                    seen.add(k)
+                    models.append({'name': k, 'type': 'SQL Table', 'file': f['path']})
+
+    return models
+
+
+def extract_functions(files, root):
+    cats = {'Python Functions': [], 'JS/TS Functions': []}
+    seen = {'Python Functions': set(), 'JS/TS Functions': set()}
+
+    py_func_re = re.compile(r'^\s*(?:async\s+)?def\s+(\w+)\s*\(', re.MULTILINE)
+    js_func_re = re.compile(r'(?:function\s+(\w+)|(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\()', re.MULTILINE)
+
+    for f in files:
+        if f['ext'] == '.py':
+            content = read_file_safe(root / f['path'], 300)
+            for m in py_func_re.finditer(content):
+                name = m.group(1)
+                if name not in seen['Python Functions']:
+                    seen['Python Functions'].add(name)
+                    cats['Python Functions'].append({'name': name, 'file': f['path']})
+        elif f['ext'] in ('.js', '.ts', '.jsx', '.tsx'):
+            content = read_file_safe(root / f['path'], 300)
+            for m in js_func_re.finditer(content):
+                name = m.group(1) or m.group(2)
+                if name and not name.startswith('_') and name not in seen['JS/TS Functions']:
+                    seen['JS/TS Functions'].add(name)
+                    cats['JS/TS Functions'].append({'name': name, 'file': f['path']})
+
+    return {cat: items[:50] for cat, items in cats.items() if items}
+
+
+def analyze_imports(files, root):
+    imports = defaultdict(int)
+    py_imp = re.compile(r'^(?:from|import)\s+([\w.]+)', re.MULTILINE)
+    js_imp = re.compile(r'(?:import\s+.*?from\s+[\'"]|require\s*\(\s*[\'"])(.*?)[\'"]', re.MULTILINE)
+
+    for f in files:
+        if f['ext'] not in ('.py', '.js', '.ts', '.jsx', '.tsx'):
+            continue
+        content = read_file_safe(root / f['path'], 200)
+        pat = py_imp if f['ext'] == '.py' else js_imp
+        for m in pat.finditer(content):
+            imports[m.group(1)] += 1
+
+    return sorted(imports.items(), key=lambda x: -x[1])[:30]
+
+
+def get_recent_changes(root):
+    try:
+        r = subprocess.run(
+            ['git', '-C', str(root), 'log', '--oneline', '-10', '--format=%h %s (%ar)'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except:
+        pass
+    return None
+
+
+def build_tree(files, max_depth=4):
+    tree = {}
+    for f in files:
+        parts = f['path'].split(os.sep)
+        if len(parts) > max_depth:
+            parts = parts[:max_depth] + ['...']
+        node = tree
+        for part in parts:
+            node = node.setdefault(part, {})
+
+    def render(node, prefix=''):
+        keys = sorted(node.keys())
+        lines = []
+        for i, key in enumerate(keys):
+            is_last = i == len(keys) - 1
+            conn = '└── ' if is_last else '├── '
+            if node[key]:
+                lines.append(f"{prefix}{conn}{key}/")
+                ext = '    ' if is_last else '│   '
+                lines.append(render(node[key], prefix + ext))
+            else:
+                lines.append(f"{prefix}{conn}{key}")
+        return '\n'.join(lines)
+
+    return render(tree)
+
+
+def detect_languages(files):
+    ext_lines = defaultdict(int)
+    for f in files:
+        ext_lines[f['ext']] += f['lines']
+    total = sum(ext_lines.values()) or 1
+    return [{'ext': ext, 'lines': lines, 'pct': round(lines / total * 100, 1)}
+            for ext, lines in sorted(ext_lines.items(), key=lambda x: -x[1])]
+
+
+def to_json_report(files, root, at_risk, gi_exists, gi_count, publish_issues, publish_warnings):
+    """Generate JSON output for --format json."""
+    root = Path(root)
+    project_type = analyze_project_type(files)
+    endpoints = extract_endpoints(files, root)
+    models = extract_models(files, root)
+    imports = analyze_imports(files, root)
+    langs = detect_languages(files)
+    tree_str = build_tree(files)
+    total_lines = sum(f['lines'] for f in files)
+    total_kb = sum(f['size'] for f in files) / 1024
+    recent = get_recent_changes(root)
+
+    functions = extract_functions(files, root)
+
+    report = {
+        'project': root.name,
+        'overview': {
+            'files': len(files),
+            'linesOfCode': total_lines,
+            'sizeKB': round(total_kb, 1),
+            'projectType': project_type,
+            'languages': langs[:8],
+        },
+        'architectureMap': tree_str,
+        'apiEndpoints': endpoints,
+        'dataModels': models,
+        'functionsAndClasses': functions,
+        'importedDependencies': [{'module': imp, 'fileCount': count} for imp, count in imports],
+        'recentChanges': recent,
+        'gitignoreAudit': {
+            'riskFiles': at_risk,
+            'gitignoreExists': gi_exists,
+            'patternCount': gi_count,
+        },
+        'publishSafety': {
+            'issues': publish_issues[:20] if publish_issues else [],
+            'warnings': publish_warnings if publish_warnings else [],
+        },
+    }
+    # Sort by weight for files section
+    report['sortedFiles'] = [
+        {'path': f['path'], 'lines': f.get('lines', 0), 'size': f['size']}
+        for f in sorted(files, key=lambda x: -x.get('weight', 0))
+    ]
+    return json.dumps(report, indent=2, ensure_ascii=False)
+
+
+# ─── Report generation ───────────────────────────────────────────────
+def generate_report(files, root, at_risk, gi_exists, gi_count, publish_issues=None, publish_warnings=None):
+    root = Path(root)
+    project_type = analyze_project_type(files)
+    endpoints = extract_endpoints(files, root)
+    models = extract_models(files, root)
+    functions = extract_functions(files, root)
+    imports = analyze_imports(files, root)
+    langs = detect_languages(files)
+    tree = build_tree(files)
+    total_lines = sum(f['lines'] for f in files)
+    total_kb = sum(f['size'] for f in files) / 1024
+    recent = get_recent_changes(root)
+
+    r = []
+    r.append(f"# 📋 Project Analysis: `{root.name}`")
+    r.append(f"> Generated by **ctx-shrink v2** — AI coding agent project analyzer")
+    r.append(f"> 📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    r.append("")
+    r.append("---\n")
+
+    # Overview
+    r.append("## 📊 Overview\n")
+    r.append(f"- **Files:** {len(files)}")
+    r.append(f"- **Lines of Code:** {total_lines:,}")
+    r.append(f"- **Size:** {total_kb:.1f} KB")
+    r.append(f"- **Project Type:** {', '.join(project_type)}")
+    r.append("- **Languages:**")
+    for lang in langs[:8]:
+        bar = '█' * int(lang['pct'] / 2) + '░' * (50 - int(lang['pct'] / 2))
+        r.append(f"  - `{lang['ext']}`  {bar}  {lang['pct']}%  ({lang['lines']:,} lines)")
+    r.append("\n---\n")
+
+    # Architecture tree
+    r.append("## 🏗️ Architecture Map\n")
+    r.append("```\n")
+    r.append(tree)
+    r.append("```\n\n---\n")
+
+    # Endpoints
+    if endpoints:
+        r.append("## 🌐 API Endpoints\n")
+        r.append("| Method | Path | File |")
+        r.append("|--------|------|------|")
+        for ep in endpoints:
+            r.append(f"| `{ep['method']}` | `{ep['path']}` | `{ep['file']}` |")
+        r.append("\n---\n")
+
+    # Models
+    if models:
+        r.append("## 💾 Data Models\n")
+        for m in models:
+            r.append(f"- **{m['name']}** ({m['type']}) → `{m['file']}`")
+        r.append("\n---\n")
+
+    # Functions
+    if functions:
+        r.append("## ⚙️ Functions & Classes\n")
+        for cat, funcs in functions.items():
+            r.append(f"### {cat}")
+            r.append("")
+            for f in funcs[:25]:
+                r.append(f"- `{f['name']}` → `{f['file']}`")
+            r.append("")
+        r.append("---\n")
+
+    # Imports
+    if imports:
+        r.append("## 🔗 Key Dependencies\n")
+        for imp, count in imports:
+            r.append(f"- `{imp}` (used in {count} file{'s' if count > 1 else ''})")
+        r.append("\n---\n")
+
+    # Gitignore Audit
+    r.append("## 🛡️ Gitignore Audit\n")
+    if at_risk:
+        r.append(f"⚠️ **{len(at_risk)} sensitive file(s) found that are NOT in `.gitignore`!**\n")
+        r.append("| File | Size | Risk |")
+        r.append("|------|------|------|")
+        for f in at_risk[:20]:
+            size = f"{f['size']/1024:.1f} KB" if f['size'] > 1024 else f"{f['size']} B"
+            r.append(f"| `{f['path']}` | {size} | {f['risk']} |")
+        if len(at_risk) > 20:
+            r.append(f"| ... and {len(at_risk) - 20} more |")
+        r.append("")
+        r.append("### 🔧 Quick Fix")
+        r.append("Add these lines to your `.gitignore`:\n")
+        r.append("```")
+        for f in at_risk:
+            r.append(f['path'].split('/')[-1])
+        r.append("```\n")
+    else:
+        r.append("✅ No sensitive files found that should be in `.gitignore`.\n")
+
+    if gi_exists:
+        r.append(f"📄 `.gitignore` exists with {gi_count} patterns.")
+    else:
+        r.append("⚠️ No `.gitignore` file found! Create one to protect sensitive files.")
+    r.append("\n---\n")
+
+    # Publish Safety Audit
+    r.append("## 📦 Publish Safety Audit\n")
+    if publish_issues or publish_warnings:
+        if publish_issues:
+            r.append(f"⚠️ **{len(publish_issues)} file(s) that should NOT be in a published package:**\n")
+            r.append("| File | Size | Reason |")
+            r.append("|------|------|--------|")
+            for issue in publish_issues[:15]:
+                size = f"{issue['size']/1024:.1f} KB" if issue['size'] > 1024 else f"{issue['size']} B"
+                risk = issue['description'].split(' ')[0]
+                desc = issue['description'].split('—')[-1].strip() if '—' in issue['description'] else issue['description']
+                r.append(f"| `{issue['path']}` | {size} | {desc} |")
+            if len(publish_issues) > 15:
+                r.append(f"| ... and {len(publish_issues)-15} more |")
+            r.append("")
+        if publish_warnings:
+            r.append("### ⚠️ Warnings")
+            r.append("")
+            for w in publish_warnings:
+                r.append(f"- {w}")
+            r.append("")
+    else:
+        r.append("✅ No packaging safety issues detected.")
+        r.append("")
+    r.append("---\n")
+
+    # Recent changes
+    if recent:
+        r.append("## 📝 Recent Changes\n")
+        r.append(f"```\n{recent}\n```\n\n---\n")
+
+    # AI Agent Guide
+    r.append("## 🤖 Using with AI Agents\n")
+    r.append("This is a **map**, not a code dump. Feed it to any AI agent.")
+    r.append("The agent now knows your project structure and can read specific files on demand.\n")
+    r.append("### Key files to reference:\n")
+    key_names = {'README.md', 'main.py', 'app.py', 'index.ts', 'server.js',
+                 'requirements.txt', 'package.json', 'Dockerfile', 'config.py',
+                 'database.py', 'ai_service.py', 'models.py'}
+    for f in sorted(files, key=lambda x: -x['weight'] if 'weight' in x else -x['lines']):
+        if any(k in f['path'] for k in key_names):
+            r.append(f"   - `{f['path']}` ({f.get('lines', '?')} lines)")
+    r.append("")
+
+    return '\n'.join(r)
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="ctx-shrink v2 — Smart codebase analyzer for AI coding agents",
+        epilog="examples:\n  ctx-shrink .\n  ctx-shrink ./myproject --max-depth 4\n  ctx-shrink . --format json\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('directory', nargs='?', default='.',
+                        help='Project directory to scan (default: current)')
+    parser.add_argument('--format', '-f', choices=['markdown', 'json'],
+                        default='markdown', help='Output format')
+    parser.add_argument('--max-depth', '-d', type=int, default=None,
+                        help='Maximum directory depth')
+    parser.add_argument('--out', '-o', type=str, default=None,
+                        help='Output file path')
+
+    args = parser.parse_args()
+    root = Path(args.directory).resolve()
+
+    if not root.is_dir():
+        print(f"❌ Directory not found: {root}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"📦 ctx-shrink v2: Analyzing {root}...")
+    files = scan_files(root, max_depth=args.max_depth)
+    total_lines = sum(f['lines'] for f in files)
+    print(f"   Found {len(files)} files ({total_lines:,} lines)")
+    print(f"   Analyzing architecture, endpoints, models, dependencies...")
+    print(f"   Checking .gitignore safety...\n")
+
+    # Gitignore audit
+    at_risk, gi_exists, gi_count = check_gitignore(root, max_depth=args.max_depth)
+
+    # Publish safety audit (catches Claude Code-style source map leaks)
+    publish_issues, publish_warnings = check_publish_safety(root, max_depth=args.max_depth)
+    if publish_issues:
+        print(f"   ⚠️ {len(publish_issues)} publish-safety issue(s) found")
+    if publish_warnings:
+        for w in publish_warnings[:3]:
+            print(f"   ⚠️ {w}")
+
+    # Generate output based on format
+    if args.format == 'json':
+        output = to_json_report(files, root, at_risk, gi_exists, gi_count, publish_issues, publish_warnings)
+    else:
+        output = generate_report(files, root, at_risk, gi_exists, gi_count, publish_issues, publish_warnings)
+
+    outfile = args.out or ('ctx-shrink.json' if args.format == 'json' else 'AI-CONTEXT.md')
+    outpath = root / outfile
+    with open(outpath, 'w', encoding='utf-8') as f:
+        f.write(output)
+
+    lines = output.count('\n')
+    kb = len(output) / 1024
+    print(f"✅ Project analysis saved to: {outpath}")
+    print(f"   {len(files)} files → {kb:.1f} KB ({lines} lines)")
+    print(f"   Use with: aider --read {outfile}")
+    print(f"   Or paste into any AI coding agent.\n")
+
+
+if __name__ == '__main__':
+    main()
