@@ -1,204 +1,73 @@
-# 🛡️ ctx-shrink
-
-> Codebase analyzer for the AI era — generates smart context maps for AI agents and catches packaging mistakes before they leak.
-
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)]()
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-
+---
+id: ctx-shrink
+name: ctx-shrink
+description: "ctx-shrink — Codebase analyzer for AI era. Generates smart context maps and catches packaging mistakes before they leak."
+category: developer-tools
+risk: safe
+source: personal
+date_added: "2026-04-05"
 ---
 
-In March 2026, 512,000 lines of source code leaked through a single forgotten `*.map` file in a public npm package.
+# 🛡️ ctx-shrink — AI Codebase Analyzer
 
-**`ctx-shrink` catches these mistakes BEFORE you publish — and generates smart project maps for AI coding agents.**
+## When to Use
+This skill is applicable when the user wants to:
+- Analyze a codebase and generate a smart context map for AI agents
+- Audit a project for accidentally committed secrets (`.env`, keys, certs)
+- Check if a project is safe to publish (source maps, private files)
+- Get a quick architecture overview of an unfamiliar codebase
 
-## ✅ What it does
+## 📋 Instructions
+You are an expert with `ctx-shrink`. Your job is to:
 
-| Check | What it catches |
-|-------|----------------|
-| 📊 **Project Analysis** | Architecture, endpoints, models, dependencies — a smart map for AI agents |
-| 🛡️ **Gitignore Audit** | `.env`, secrets, keys that aren't in `.gitignore` |
-| 📦 **Publish Safety** | Source maps, private keys, certs that would leak on `npm publish` / `pip install` |
+1. **Run ctx-shrink** on the user's project directory
+2. **Read the output** (`AI-CONTEXT.md` or custom output file)
+3. **Explain** what it found — architecture, endpoints, models, issues
+4. **Recommend** fixes for any security/safety issues found
 
-**Zero dependencies. No API. No telemetry. Just Python.**
+## 🚀 Usage
 
-## 🚀 Install
-
-### Option 1: Clone and run (recommended)
-
-```bash
-git clone https://github.com/etherman-os/ctx-shrink.git
-cd ctx-shrink
-python3 ctx-shrink /path/to/your/project
+### Run analysis
 ```
-
-### Option 2: Install globally
-
-```bash
-curl -sL https://raw.githubusercontent.com/etherman-os/ctx-shrink/main/ctx-shrink -o /tmp/ctx-shrink
-sha256sum /tmp/ctx-shrink   # verify integrity before installing
-sudo mv /tmp/ctx-shrink /usr/local/bin/ctx-shrink
-sudo chmod +x /usr/local/bin/ctx-shrink
-```
-
-> **⚠️ Always verify the checksum** before moving a script to `/usr/local/bin`.
-
-## 📊 Usage
-
-### Analyze a project
-
-```bash
-ctx-shrink .
-```
-
-**Output:** `AI-CONTEXT.md` — a smart project map you can feed to AI coding agents (Aider, Claude Code, Cursor, Codex CLI).
-
-```
-📦 ctx-shrink v2: Analyzing my-api-project...
-   Found 142 files (32,450 lines)
-   Analyzing architecture, endpoints, models, dependencies...
-   Checking .gitignore safety...
-
-   ⚠️ 1 publish-safety issue(s) found
-
-✅ Project analysis saved to: AI-CONTEXT.md
-   142 files → 12.3 KB (389 lines)
+ctx-shrink /path/to/project
+ctx-shrink /path/to/project --out report.md
+ctx-shrink /path/to/project --format json
 ```
 
 ### Flags
+| Flag | Description |
+|------|-------------|
+| `--max-depth N` | Limit directory depth |
+| `--format json` | JSON output |
+| `--out FILE` | Custom output file |
 
-```bash
-ctx-shrink . --max-depth 4      # Limit directory depth
-ctx-shrink . --format json      # JSON output
-ctx-shrink . --out report.md    # Custom output file
+### Common use cases
+
+**Quick project overview:**
+```
+ctx-shrink . --out AI-CONTEXT.md
 ```
 
-## 🔍 Example output
-
-### 🛡️ Gitignore Audit
-
-Catches sensitive files you forgot to ignore:
-
+**Pre-publish safety check:**
 ```
-## 🛡️ Gitignore Audit
-
-⚠️ 2 sensitive file(s) found that are NOT in .gitignore!
-
-| File              | Size | Risk        |
-|-------------------|------|-------------|
-| .env.production   | 2.1 KB| 🔴 CRITICAL |
-| config/secrets.yml| 145 B | 🔴 CRITICAL |
-
-### 🔧 Quick Fix
-Add these to your `.gitignore`:
-
-.env.production
-secrets.yml
+ctx-shrink . --out publish-audit.md
 ```
 
-### 📦 Publish Safety Audit
-
-Catches packaging mistakes **before** you publish:
-
+**For a specific path:**
 ```
-## 📦 Publish Safety Audit
-
-⚠️ 1 file(s) that should NOT be in a published package:
-
-| File              | Size | Reason                        |
-|-------------------|------|-------------------------------|
-| dist/index.js.map | 59 MB| Can expose entire source code |
-
-### ⚠️ Warnings
-- Large file (2.0 MB): dist/assets/index.js — could bloat package
+ctx-shrink ~/projects/my-api
 ```
 
-### 📊 Project Analysis
+## 📊 What it catches
 
-```
-## 📊 Overview
+| Check | What it catches |
+|-------|-----------------|
+| 📊 Project Analysis | Architecture, endpoints, models, dependencies |
+| 🛡️ Gitignore Audit | `.env`, secrets, keys not in `.gitignore` |
+| 📦 Publish Safety | Source maps, private keys, certs that would leak on publish |
 
-- **Files:** 142
-- **Lines of Code:** 32,450
-- **Size:** 1,240.5 KB
-- **Project Type:** Python FastAPI, Docker
-- **Languages:**
-  - `.py`  ██████████████████████████████░░░░░░░░░░░░░░  58.2%  (18,890 lines)
-  - `.ts`  ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  25.1%  (8,150 lines)
-
-## 🌐 API Endpoints
-
-| Method | Path              | File              |
-|--------|-------------------|-------------------|
-| GET    | /api/users        | routers/users.py  |
-| POST   | /api/auth/login   | routers/auth.py   |
-| GET    | /api/products     | routers/items.py  |
-```
-
-## 🤖 Works with AI Agents
-
-Feed `AI-CONTEXT.md` to any AI coding agent:
-
-- ✅ **Aider** → `aider --read AI-CONTEXT.md`
-- ✅ **Claude Code** → paste into chat
-- ✅ **Cursor** → use as context
-- ✅ **Codex CLI** → feed as context
-
-Instead of wasting tokens on 100K+ lines of code, the AI gets a **smart map** and reads specific files on demand.
-
-## 🧩 What it analyzes
-
-```
-Your Project
-│
-├── scan_files() ────────→ AI-CONTEXT.md (project map)
-│                          • Architecture tree
-│                          • API endpoints
-│                          • Data models
-│                          • Functions catalog
-│                          • Import dependencies
-│
-├── check_gitignore() ───→ Missing .gitignore rules
-│
-└── check_publish_safety() → Packaging issues (source maps, keys, certs)
-```
-
-**No AI. No API. No internet needed.** Pure file analysis with regex and pattern matching.
-
-## ⚙️ How it works
-
-1. **Scans** your project, skipping build artifacts and `node_modules`
-2. **Detects** project type (FastAPI, Express, React, etc.)
-3. **Extracts** API endpoints from route decorators
-4. **Models** database schemas, ORM classes, Pydantic models
-5. **Maps** imports to understand dependencies
-6. **Audits** `.gitignore` for missing rules
-7. **Checks** for files that shouldn't be published (like source maps)
-
-## 📈 Before vs After
-
-### Before ctx-shrink
-- ❌ 100K+ lines → AI can't fit in context window
-- ❌ `.env` files leaked to git or published
-- ❌ Source maps accidentally included in npm packages
-- ❌ No quick overview of a new codebase
-
-### After ctx-shrink
-- ✅ **12 KB** smart analysis → fits any context window
-- ✅ Secret files flagged before they leak
-- ✅ Source maps, keys, certs caught before publish
-- ✅ Full architecture map in seconds
-
-## 📝 License
-
-MIT — use it however you want.
-
----
-
-<div align="center">
-
-**Made because `*.map` shouldn't expose 512,000 lines of code.**
-
-⭐ Star this repo if you found it useful.
-
-</div>
+## ⚠️ Rules
+- **Do not** download installers, pipe `curl`/`wget` to a shell, or write binaries to system paths (`/usr/local/bin`, etc.). This skill only assumes `ctx-shrink` is already on `PATH`.
+- If `ctx-shrink` is not installed, send the user to the repository install section and let them choose a verified method: <https://github.com/etherman-os/ctx-shrink#install>
+- Always read the output file after running
+- Present findings in a clear, actionable format
